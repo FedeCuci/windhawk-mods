@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              alt-tab-per-monitor
 // @name            Alt+Tab per monitor
-// @description     Pressing Alt+Tab shows all open windows on the primary display. This mod shows only the windows on the monitor where the cursor is.
-// @version         1.2
+// @description     Pressing Alt+Tab shows all open windows on the primary display. This mod shows only the windows on the monitor where the cursor (or the active window) is.
+// @version         1.3
 // @author          L3r0y
 // @github          https://github.com/L3r0yThingz
 // @include         explorer.exe
@@ -20,10 +20,17 @@ where the cursor is located, showing only the windows on that monitor.
 
 Both Alt+Tab and Win+Alt+Tab can be independently configured with:
 
-- **Display location**: Primary monitor or monitor where cursor is located.
-- **Windows to show**: All monitors, cursor's monitor only, or cursor's monitor
-  with an exception for the primary monitor (shows all windows when cursor is on
-  the primary monitor).
+- **Display location**: Primary monitor, monitor where the cursor is located, or
+  monitor where the active (focused) window is located.
+- **Windows to show**: All monitors, cursor's monitor only, cursor's monitor with
+  an exception for the primary monitor (shows all windows when cursor is on the
+  primary monitor), or the active window's monitor only.
+
+The "active window" options are useful when you want Alt+Tab to follow the
+focused window regardless of where the cursor happens to be. For example, if a
+window is focused on one monitor while the cursor rests on another monitor that
+has no focused window, the cursor-based modes would target the wrong monitor,
+whereas the active-window modes target the monitor that actually has focus.
 
 ![Gif](https://i.imgur.com/Hpg8TKh.gif)
 */
@@ -36,12 +43,14 @@ Both Alt+Tab and Win+Alt+Tab can be independently configured with:
   $description: Choose which monitor the Alt+Tab switcher appears on
   $options:
   - cursor: Monitor where cursor is located
+  - foreground: Monitor where the active window is located
   - primary: Primary monitor
 - altTabWindows: cursorMonitor
   $name: "Alt+Tab: Windows to show"
   $description: Choose which windows to show when using Alt+Tab
   $options:
   - cursorMonitor: Windows from the monitor where cursor is located
+  - foregroundMonitor: Windows from the monitor where the active window is located
   - allMonitors: Windows from all monitors
   - cursorMonitorExceptPrimary: >-
       Windows from cursor's monitor, but all windows when on primary
@@ -52,12 +61,14 @@ Both Alt+Tab and Win+Alt+Tab can be independently configured with:
   $options:
   - primary: Primary monitor
   - cursor: Monitor where cursor is located
+  - foreground: Monitor where the active window is located
 - winAltTabWindows: allMonitors
   $name: "Win+Alt+Tab: Windows to show"
   $description: Choose which windows to show when using Win+Alt+Tab
   $options:
   - allMonitors: Windows from all monitors
   - cursorMonitor: Windows from the monitor where cursor is located
+  - foregroundMonitor: Windows from the monitor where the active window is located
   - cursorMonitorExceptPrimary: >-
       Windows from cursor's monitor, but all windows when on primary
 */
@@ -73,12 +84,14 @@ Both Alt+Tab and Win+Alt+Tab can be independently configured with:
 enum class Location {
     primary,
     cursor,
+    foreground,
 };
 
 enum class WindowsToShow {
     allMonitors,
     cursorMonitor,
     cursorMonitorExceptPrimary,
+    foregroundMonitor,
 };
 
 struct {
@@ -95,6 +108,15 @@ enum class WinVersion {
 };
 
 WinVersion g_winVersion;
+
+// The last "real" foreground window, tracked continuously so that when the
+// Alt+Tab switcher opens (and becomes the foreground window itself), we still
+// know which window was active just before it. Used by the "active window"
+// location/windows modes.
+std::atomic<HWND> g_lastForegroundWindow;
+HWINEVENTHOOK g_foregroundEventHook;
+HANDLE g_foregroundHookThread;
+DWORD g_foregroundHookThreadId;
 
 std::atomic<DWORD> g_threadIdForAltTabShowWindow;
 std::atomic<DWORD> g_lastThreadIdForXamlAltTabViewHost_CreateInstance;
@@ -159,6 +181,28 @@ bool IsWinKeyPressed() {
     return GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0;
 }
 
+HMONITOR GetCursorMonitor() {
+    POINT pt;
+    if (!GetCursorPos(&pt)) {
+        return nullptr;
+    }
+
+    return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+}
+
+// Returns the monitor of the window that was active before the Alt+Tab switcher
+// opened, falling back to the cursor's monitor if it's unavailable. The window
+// is tracked continuously (see ForegroundWinEventProc) because by the time the
+// switcher's hooks run, the switcher itself is already the foreground window.
+HMONITOR GetForegroundMonitor() {
+    HWND hForegroundWindow = g_lastForegroundWindow;
+    if (hForegroundWindow && IsWindow(hForegroundWindow)) {
+        return MonitorFromWindow(hForegroundWindow, MONITOR_DEFAULTTONEAREST);
+    }
+
+    return GetCursorMonitor();
+}
+
 bool HandleAltTabWindow(RECT* rect) {
     auto location = IsWinKeyPressed() ? g_settings.winAltTabLocation
                                       : g_settings.altTabLocation;
@@ -167,12 +211,11 @@ bool HandleAltTabWindow(RECT* rect) {
         return false;
     }
 
-    POINT pt;
-    if (!GetCursorPos(&pt)) {
+    HMONITOR hMon = location == Location::foreground ? GetForegroundMonitor()
+                                                     : GetCursorMonitor();
+    if (!hMon) {
         return false;
     }
-
-    auto hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
 
     MONITORINFO monInfo;
     monInfo.cbSize = sizeof(MONITORINFO);
@@ -214,13 +257,17 @@ HRESULT GetWindowHandleFromApplicationView(void* applicationView,
     return hr;
 }
 
-bool IsWindowOnCursorMonitor(HWND windowHandle) {
-    POINT pt;
-    if (!GetCursorPos(&pt)) {
+bool IsWindowOnTargetMonitor(HWND windowHandle) {
+    auto windows = IsWinKeyPressed() ? g_settings.winAltTabWindows
+                                     : g_settings.altTabWindows;
+
+    HMONITOR hMon = windows == WindowsToShow::foregroundMonitor
+                        ? GetForegroundMonitor()
+                        : GetCursorMonitor();
+    if (!hMon) {
         return false;
     }
 
-    auto hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     auto hMonFromWindow =
         MonitorFromWindow(windowHandle, MONITOR_DEFAULTTONEAREST);
 
@@ -266,7 +313,7 @@ HRESULT WINAPI CVirtualDesktop_IsViewVisible_Hook(void* pThis,
         return ret;
     }
 
-    if (!IsWindowOnCursorMonitor(windowHandle)) {
+    if (!IsWindowOnTargetMonitor(windowHandle)) {
         *isVisible = FALSE;
     }
 
@@ -470,6 +517,86 @@ HRESULT WINAPI CAltTabViewHost_CreateInstance_Win11_Hook(void* pThis,
     });
 }
 
+// Returns true for windows that should not be remembered as the "last
+// foreground window" - most importantly the Alt+Tab / Task View switcher
+// itself, which becomes the foreground window when it opens.
+bool IsSwitcherOrNonTrackableWindow(HWND hWnd) {
+    if (GetAncestor(hWnd, GA_ROOT) != hWnd) {
+        return true;
+    }
+
+    if (!IsWindowVisible(hWnd)) {
+        return true;
+    }
+
+    if (GetWindowLongPtr(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) {
+        return true;
+    }
+
+    WCHAR className[256];
+    if (!GetClassName(hWnd, className, ARRAYSIZE(className))) {
+        return false;
+    }
+
+    // The XAML Alt+Tab / Win+Tab host (Win11) and the legacy switchers (Win10 /
+    // ExplorerPatcher).
+    return wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 ||
+           wcscmp(className, L"MultitaskingViewFrame") == 0 ||
+           wcscmp(className, L"TaskSwitcherWnd") == 0 ||
+           wcscmp(className, L"Windows.UI.Core.CoreWindow") == 0;
+}
+
+void CALLBACK ForegroundWinEventProc(HWINEVENTHOOK hWinEventHook,
+                                     DWORD event,
+                                     HWND hWnd,
+                                     LONG idObject,
+                                     LONG idChild,
+                                     DWORD dwEventThread,
+                                     DWORD dwmsEventTime) {
+    if (event != EVENT_SYSTEM_FOREGROUND || !hWnd ||
+        idObject != OBJID_WINDOW) {
+        return;
+    }
+
+    if (IsSwitcherOrNonTrackableWindow(hWnd)) {
+        WCHAR className[256] = L"";
+        GetClassName(hWnd, className, ARRAYSIZE(className));
+        Wh_Log(L"Ignoring foreground window, class=%s", className);
+        return;
+    }
+
+    g_lastForegroundWindow = hWnd;
+}
+
+DWORD WINAPI ForegroundHookThreadProc(LPVOID lpParameter) {
+    g_foregroundEventHook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+        ForegroundWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+    if (!g_foregroundEventHook) {
+        Wh_Log(L"SetWinEventHook failed, error=%lu", GetLastError());
+    }
+
+    // Seed with the current foreground window so the first Alt+Tab works even
+    // before any foreground change is observed.
+    HWND hForeground = GetForegroundWindow();
+    if (hForeground && !IsSwitcherOrNonTrackableWindow(hForeground)) {
+        g_lastForegroundWindow = hForeground;
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    if (g_foregroundEventHook) {
+        UnhookWinEvent(g_foregroundEventHook);
+        g_foregroundEventHook = nullptr;
+    }
+
+    return 0;
+}
+
 void LoadSettings() {
     auto loadLocation = [](PCWSTR name, Location defaultVal) {
         PCWSTR val = Wh_GetStringSetting(name);
@@ -478,6 +605,8 @@ void LoadSettings() {
             result = Location::primary;
         } else if (wcscmp(val, L"cursor") == 0) {
             result = Location::cursor;
+        } else if (wcscmp(val, L"foreground") == 0) {
+            result = Location::foreground;
         }
         Wh_FreeStringSetting(val);
         return result;
@@ -492,6 +621,8 @@ void LoadSettings() {
             result = WindowsToShow::cursorMonitor;
         } else if (wcscmp(val, L"cursorMonitorExceptPrimary") == 0) {
             result = WindowsToShow::cursorMonitorExceptPrimary;
+        } else if (wcscmp(val, L"foregroundMonitor") == 0) {
+            result = WindowsToShow::foregroundMonitor;
         }
         Wh_FreeStringSetting(val);
         return result;
@@ -637,7 +768,26 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
+    // Track the foreground window for the "active window" modes. Done on a
+    // dedicated thread with a message loop, as required by WINEVENT_OUTOFCONTEXT.
+    g_foregroundHookThread = CreateThread(nullptr, 0, ForegroundHookThreadProc,
+                                          nullptr, 0, &g_foregroundHookThreadId);
+    if (!g_foregroundHookThread) {
+        Wh_Log(L"CreateThread failed, error=%lu", GetLastError());
+    }
+
     return TRUE;
+}
+
+void Wh_ModUninit() {
+    Wh_Log(L">");
+
+    if (g_foregroundHookThread) {
+        PostThreadMessage(g_foregroundHookThreadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_foregroundHookThread, INFINITE);
+        CloseHandle(g_foregroundHookThread);
+        g_foregroundHookThread = nullptr;
+    }
 }
 
 void Wh_ModSettingsChanged() {
